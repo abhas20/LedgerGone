@@ -1,0 +1,27 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg16
+    container_name: ledgergone_timescaledb
+    environment:
+      POSTGRES_USER: tsdbadmin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: tsdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: ledgergone_web
+    ports:
+      - "8501:8501"
+    environment:
+      - DATABASE_URL=postgres://tsdbadmin:password123@timescaledb:5432/tsdb
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      - timescaledb
+
+volumes:
+  timescale_data:

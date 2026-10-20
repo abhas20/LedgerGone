@@ -4,8 +4,8 @@ Located in /sample_data outside src for clean modularity.
 """
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
-from src.embeddings import generate_embeddings
-from src.db import insert_ledger_entry
+from embeddings import generate_embeddings
+from db import insert_ledger_entry
 
 SAMPLE_PRESETS = [
     {

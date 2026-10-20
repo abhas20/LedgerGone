@@ -2,29 +2,43 @@
 
 Manages time-series financial events and semantic vector search for kirana store ledger items.
 """
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pgvector.psycopg2 import register_vector
-from src.config import DATABASE_URL, EMBEDDING_DIM
+
+try:
+    from src.config import DATABASE_URL, EMBEDDING_DIM
+except ImportError:
+    from config import DATABASE_URL, EMBEDDING_DIM
 
 
-def get_connection():
+def get_connection(use_vector: bool = True):
     """Get a connected PostgreSQL client configured for Timescale and pgvector."""
     conn = psycopg2.connect(DATABASE_URL)
-    register_vector(conn)
+    if use_vector:
+        try:
+            register_vector(conn)
+        except psycopg2.ProgrammingError:
+            # Extension not created yet; init_db() will create and register it
+            conn.rollback()
     return conn
 
 
 def init_db():
     """Idempotently initialize TigerData TimescaleDB hypertables and pgvector tables."""
-    with get_connection() as conn:
+    with get_connection(use_vector=False) as conn:
         with conn.cursor() as cur:
-            # 1. Ensure required PostgreSQL extensions
+            # 1. Ensure required PostgreSQL extensions first
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+        conn.commit()
 
+        # Now safely register pgvector on this connection
+        register_vector(conn)
+
+        with conn.cursor() as cur:
             # 2. Time-series master ledger table
             # Must include created_at in primary key for TimescaleDB hypertable partitioning
             cur.execute("""
@@ -46,29 +60,43 @@ def init_db():
                     PRIMARY KEY (id, created_at)
                 );
             """)
+            conn.commit()
 
             # Convert ledger_entries into a TimescaleDB Hypertable partitioned on created_at
             try:
                 cur.execute("""
                     SELECT create_hypertable('ledger_entries', 'created_at', if_not_exists => TRUE);
                 """)
+                conn.commit()
             except Exception as e:
-                # May already be a hypertable or single table fallback
+                conn.rollback()  # Critical: prevent InFailedSqlTransaction abort!
                 print(f"[Timescale Hypertable Notice]: {e}")
 
             # 3. Line items table with pgvector embeddings for semantic item discovery
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS ledger_items (
-                    id SERIAL PRIMARY KEY,
+                    id SERIAL,
                     entry_id INT NOT NULL,
-                    entry_created_at TIMESTAMPTZ NOT NULL,
+                    entry_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     item_name TEXT NOT NULL,
                     quantity NUMERIC(10,2) DEFAULT 1.0,
                     unit_price NUMERIC(12,2) DEFAULT 0.0,
                     total_price NUMERIC(12,2) DEFAULT 0.0,
-                    item_embedding vector({EMBEDDING_DIM})
+                    item_embedding vector({EMBEDDING_DIM}),
+                    PRIMARY KEY (id, entry_created_at)
                 );
             """)
+            conn.commit()
+
+            # Also make ledger_items a hypertable for time-series item price tracking
+            try:
+                cur.execute("""
+                    SELECT create_hypertable('ledger_items', 'entry_created_at', if_not_exists => TRUE);
+                """)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[Timescale Items Hypertable Notice]: {e}")
 
             # 4. HNSW Vector Index for fast semantic item matching
             cur.execute("""
@@ -92,7 +120,7 @@ def insert_ledger_entry(
 ) -> int:
     """Insert a new audited ledger entry and its vectorized line items in a single transaction."""
     created_at = entry_data.get("created_at") or datetime.now()
-    
+
     with get_connection() as conn:
         with conn.cursor() as cur:
             # Insert into time-series ledger_entries hypertable
@@ -118,14 +146,14 @@ def insert_ledger_entry(
                 entry_data.get("notes", ""),
                 entry_data.get("raw_text", "")
             ))
-            
+
             entry_id = cur.fetchone()[0]
 
             # Insert line items with vector embeddings
             if items:
                 for idx, item in enumerate(items):
                     emb = embeddings[idx] if embeddings and idx < len(embeddings) else None
-                    cur.execute(f"""
+                    cur.execute("""
                         INSERT INTO ledger_items (
                             entry_id, entry_created_at, item_name, quantity, unit_price, total_price, item_embedding
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s);
@@ -199,7 +227,6 @@ def get_time_series_cashflow(days: int = 30) -> List[Dict[str, Any]]:
     with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             try:
-                # TimescaleDB time_bucket query
                 cur.execute("""
                     SELECT 
                         time_bucket('1 day', created_at) AS bucket_day,
@@ -208,13 +235,13 @@ def get_time_series_cashflow(days: int = 30) -> List[Dict[str, Any]]:
                         COALESCE(SUM(pending_balance), 0) AS daily_udhaar,
                         COUNT(*) AS entries_count
                     FROM ledger_entries
-                    WHERE created_at >= NOW() - INTERVAL '%s days'
+                    WHERE created_at >= NOW() - (%s * INTERVAL '1 day')
                     GROUP BY bucket_day
                     ORDER BY bucket_day ASC;
                 """, (days,))
                 return [dict(row) for row in cur.fetchall()]
             except Exception:
-                # Fallback to standard DATE_TRUNC if hypertable is in transition
+                conn.rollback()  # Reset failed transaction before fallback query!
                 cur.execute("""
                     SELECT 
                         DATE_TRUNC('day', created_at) AS bucket_day,
@@ -223,7 +250,7 @@ def get_time_series_cashflow(days: int = 30) -> List[Dict[str, Any]]:
                         COALESCE(SUM(pending_balance), 0) AS daily_udhaar,
                         COUNT(*) AS entries_count
                     FROM ledger_entries
-                    WHERE created_at >= NOW() - INTERVAL '%s days'
+                    WHERE created_at >= NOW() - (%s * INTERVAL '1 day')
                     GROUP BY bucket_day
                     ORDER BY bucket_day ASC;
                 """, (days,))
@@ -260,13 +287,14 @@ def semantic_search_items(
 
 def get_vendor_statement(vendor_name: str) -> Dict[str, Any]:
     """Retrieve full statement and running ledger for a specific vendor/customer."""
+    pattern = f"%{vendor_name.strip()}%"
     with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT * FROM ledger_entries
                 WHERE vendor_name ILIKE %s
                 ORDER BY created_at ASC;
-            """, (vendor_name.strip(),))
+            """, (pattern,))
             entries = [dict(row) for row in cur.fetchall()]
 
             cur.execute("""
@@ -276,7 +304,7 @@ def get_vendor_statement(vendor_name: str) -> Dict[str, Any]:
                     COALESCE(SUM(pending_balance), 0) AS total_pending
                 FROM ledger_entries
                 WHERE vendor_name ILIKE %s;
-            """, (vendor_name.strip(),))
+            """, (pattern,))
             totals = dict(cur.fetchone() or {})
 
             return {

@@ -8,8 +8,8 @@ import pandas as pd
 from PIL import Image
 from datetime import datetime
 
-from src.config import DATABASE_URL, DEFAULT_GEMMA_MODEL, OLLAMA_BASE_URL
-from src.db import (
+from config import DATABASE_URL, DEFAULT_GEMMA_MODEL, OLLAMA_BASE_URL
+from db import (
     init_db,
     insert_ledger_entry,
     get_ledger_entries,
@@ -18,9 +18,9 @@ from src.db import (
     semantic_search_items,
     get_vendor_statement
 )
-from src.embeddings import generate_embedding, generate_embeddings
-from src.gemma_extractor import extract_with_gemma_multimodal, ExtractedLedger, ExtractedItem
-from src.generate_bill import (
+from embeddings import generate_embedding, generate_embeddings
+from gemma_extractor import extract_with_gemma_multimodal, ExtractedLedger, ExtractedItem
+from generate_bill import (
     generate_whatsapp_message,
     get_whatsapp_share_url,
     generate_pdf_statement
